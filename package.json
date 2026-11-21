@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node filter_wallet.js",
     "filter": "node filter_wallet.js",
-    "browser": "node filter_wallet_browser.js"
+    "browser": "node filter_wallet.js"
   },
   "engines": {
     "node": ">=18"
