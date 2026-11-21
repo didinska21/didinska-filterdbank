@@ -1,0 +1,18 @@
+# proxy.txt — daftar proxy untuk filter_wallet.js
+# Satu proxy per baris. Baris yang diawali # diabaikan.
+# Hapus tanda # di depan proxy yang mau dipakai, lalu isi dengan proxy kamu.
+# Kalau file ini ada, script otomatis memakainya (kosongkan prompt proxy
+# untuk pakai file ini). Kosongkan / hapus semua baris kalau tidak pakai proxy.
+#
+# Format yang didukung:
+#   http://user:pass@host:port
+#   https://user:pass@host:port
+#   socks5://user:pass@host:port
+#   user:pass@host:port
+#   host:port
+#   host:port:user:pass
+#
+# Contoh (hapus # dan ganti dengan proxy asli kamu):
+# http://user:pass@1.2.3.4:8080
+# https://user:pass@1.2.3.4:8080
+# socks5://user:pass@1.2.3.4:1080
