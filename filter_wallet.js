@@ -20,10 +20,25 @@
  *   - Versi ini juga lebih lambat & lebih berat daripada versi API
  *     (tiap wallet = satu halaman web yang di-render), dan DeBank bisa
  *     menampilkan verifikasi bot (Cloudflare) ke browser otomatis.
- *   - Fallback: kalau angka di layar tidak terbaca, script memakai data
- *     yang halaman itu sendiri minta saat dimuat (bukan request API
- *     dari script). Kalau halaman menampilkan verifikasi bot, wallet
- *     itu dicatat gagal di <output>.failed.txt, bukan diam-diam hilang.
+ *   - PRESISI (diperbaiki 21 Nov 2026, dari hasil probe_net.js):
+ *     angka layar dibulatkan ke dolar penuh ("$1", tanpa sen), jadi
+ *     TIDAK dipakai sebagai sumber utama. Total presisi diambil dari
+ *     data JSON yang halaman itu sendiri muat saat dibuka:
+ *       total = jumlah balance_list tiap chain (token: usd_value,
+ *               atau amount*price kalau usd_value tidak ada)
+ *             + jumlah project_list (DeFi: stats.net_usd_value
+ *               per portfolio item SAJA — asset/debt jangan ikut
+ *               dijumlah, itu hitung ganda)
+ *     total_net_curve (titik terakhir) dipakai sebagai pembanding /
+ *     cadangan kalau penjumlahan di atas tidak ketemu. cache_balance_list
+ *     dipakai hanya kalau tidak ada satu pun balance_list per chain.
+ *     Angka layar hanya cadangan terakhir, dan dicatat sumbernya di log
+ *     tiap wallet, misal "presisi: token $0.60 + DeFi $0.00 = $0.60".
+ *     Perhatian: jangan jumlahkan SEMUA field bernama *usd* secara
+ *     rekursif — balance_list yang punya total_usd_value di atas plus
+ *     usd_value per token akan terhitung ganda (teruji: $0.60 jadi $1.20).
+ *   - Kalau halaman menampilkan verifikasi bot, wallet itu dicatat
+ *     gagal di <output>.failed.txt, bukan diam-diam hilang.
  *   - Hasil disimpan bertahap: setelah tiap wallet selesai dicek,
  *     file hasil dan file .failed.txt langsung ditulis ulang. Jadi
  *     kalau run 5 jam ini di-stop (Ctrl+C) atau screen/VPS mati di
@@ -222,8 +237,10 @@ async function resolveFiles() {
 //   3. "Net Worth" + "$X" (jaga-jaga kalau layout berubah lagi).
 //   4. "$X" setelah judul bagian "Wallet".
 // Perhatian: angka yang tampil di layar dibulatkan ke dolar penuh ("$1",
-// tanpa sen). Jadi nilai dari layar ini kasar — untuk desimal persisnya,
-// script memakai fallback data yang halaman itu sendiri minta saat dimuat.
+// tanpa sen). Jadi nilai dari layar ini KASAR dan hanya dipakai sebagai
+// jalan terakhir — nilai persisnya diambil dari data halaman (lihat
+// readBalanceFromPage). Ambang $0.20 tidak bisa diandalkan dari angka layar:
+// wallet $0.30 bisa tampil "$0" dan wallet $0.15 bisa tampil "$1".
 function parseTotalFromText(text) {
   const money = (s) => {
     const v = parseFloat(s.replace(/,/g, ''));
@@ -247,19 +264,97 @@ function parseTotalFromText(text) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Total PRESISI dari data JSON yang halaman itu sendiri muat.
+// (Hasil probe_net.js 21 Nov 2026: halaman memanggil total_net_curve,
+// balance_list per chain, project_list, dan cache_balance_list —
+// TIDAK PERNAH memanggil /user/total_balance, jadi fallback lama itu
+// tidak pernah ketangkap dan yang kepakai selalu angka layar yang bulat.)
+// ---------------------------------------------------------------------------
+function _num(v) {
+  return typeof v === 'number' && isFinite(v) ? v : null;
+}
+
+// total_net_curve -> titik terakhir kurva (total saat ini).
+function parseTotalNetCurve(j) {
+  const pickLast = (arr) => {
+    if (!Array.isArray(arr) || arr.length === 0) return null;
+    const last = arr[arr.length - 1];
+    if (Array.isArray(last)) return _num(last[1]);
+    if (last && typeof last === 'object') {
+      return _num(last.usd_value) ?? _num(last.total_usd_value) ?? _num(last.value);
+    }
+    return _num(last);
+  };
+  if (!j || typeof j !== 'object') return null;
+  if (j.data && typeof j.data === 'object' && !Array.isArray(j.data)) {
+    const v = pickLast(j.data.usd_value_list) ?? pickLast(j.data.data);
+    if (v !== null) return v;
+  }
+  return pickLast(j.data) ?? pickLast(j.usd_value_list) ?? (Array.isArray(j) ? pickLast(j) : null);
+}
+
+// balance_list satu chain -> { total, tokens }.
+// Kalau ada total_usd_value di atas, pakai itu; kalau tidak, jumlahkan
+// usd_value per token (atau amount*price). JANGAN jumlahkan keduanya.
+function parseBalanceList(j) {
+  if (!j || typeof j !== 'object') return null;
+  const tokens = Array.isArray(j) ? j : (Array.isArray(j.data) ? j.data : null);
+  if (!tokens) return null;
+  if (_num(j.total_usd_value) !== null) return { total: j.total_usd_value, tokens: tokens.length };
+  let total = 0;
+  for (const t of tokens) {
+    if (!t || typeof t !== 'object') continue;
+    if (_num(t.usd_value) !== null) total += t.usd_value;
+    else if (_num(t.amount) !== null && _num(t.price) !== null) total += t.amount * t.price;
+  }
+  return { total, tokens: tokens.length };
+}
+
+// project_list (DeFi) -> { total, items }.
+// HANYA stats.net_usd_value per portfolio item. asset_usd_value dan
+// debt_usd_value adalah komponen net, menjumlah semuanya = hitung ganda.
+function parseProjectList(j) {
+  if (!j || typeof j !== 'object') return null;
+  const protocols = Array.isArray(j) ? j : (Array.isArray(j.data) ? j.data : null);
+  if (!protocols) return null;
+  let total = 0, items = 0;
+  for (const p of protocols) {
+    const list = p && Array.isArray(p.portfolio_item_list) ? p.portfolio_item_list : [];
+    for (const it of list) {
+      const s = it && it.stats ? it.stats : null;
+      if (!s) continue;
+      items++;
+      if (_num(s.net_usd_value) !== null) total += s.net_usd_value;
+      else if (_num(s.asset_usd_value) !== null) total += s.asset_usd_value - (_num(s.debt_usd_value) || 0);
+    }
+  }
+  return { total, items };
+}
+
 async function readBalanceFromPage(page, address) {
   const url = `${PROFILE_BASE_URL}/${address}`;
 
-  // Fallback: tangkap data yang halaman itu sendiri minta saat dimuat.
-  // Dipakai hanya kalau angka di layar tidak terbaca.
-  let pageData = null;
+  // Tangkap data JSON yang halaman itu sendiri muat saat dibuka.
+  const captured = { curve: null, perChain: new Map(), project: null, cache: null };
   const onResponse = async (res) => {
     try {
-      if (res.url().includes('/user/total_balance') && res.status() === 200) {
-        const json = await res.json();
-        if (json && typeof json.total_usd_value === 'number') pageData = json.total_usd_value;
+      const u = res.url();
+      if (res.status() !== 200) return;
+      const ct = (res.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('json')) return;
+      if (u.includes('/asset/total_net_curve')) {
+        captured.curve = parseTotalNetCurve(await res.json());
+      } else if (u.includes('/token/balance_list')) {
+        const chain = (u.match(/[?&]chain=([^&]+)/) || [])[1] || 'unknown';
+        const parsed = parseBalanceList(await res.json());
+        if (parsed) captured.perChain.set(chain, parsed);
+      } else if (u.includes('/portfolio/project_list')) {
+        captured.project = parseProjectList(await res.json());
+      } else if (u.includes('/token/cache_balance_list')) {
+        captured.cache = parseBalanceList(await res.json());
       }
-    } catch { /* abaikan */ }
+    } catch { /* abaikan: satu response gagal dibaca bukan alasan gagal total */ }
   };
   page.on('response', onResponse);
 
@@ -272,29 +367,57 @@ async function readBalanceFromPage(page, address) {
       throw new Error('DeBank menampilkan verifikasi bot (Cloudflare)');
     }
 
-    // Tunggu data profil termuat: halaman SPA, angkanya muncul belakangan.
-    // Tanda data sudah masuk: teks "Data updated" atau pola total + persen.
+    // Tunggu data profil termuat, lalu beri waktu semua chain selesai
+    // dimuat (balance_list datang per chain, belakangan).
     try {
       await page.waitForFunction(() => {
         const t = document.body.innerText || '';
         return /Data updated/i.test(t) || /\$\s*[\d,]+\s*\n?\s*-?\+?\d+\.\d+%/.test(t);
       }, { timeout: 30000 });
     } catch {
-      // Lanjut ke pembacaan teks, mungkin tandanya sudah ada tapi beda ejaan.
+      // Lanjut ke pembacaan, mungkin tandanya sudah ada tapi beda ejaan.
     }
-    await page.waitForTimeout(2000); // beri waktu angka-nya ter-render
+    await page.waitForTimeout(5000); // balance_list per chain + project_list
 
     const text = await page.evaluate(() => document.body.innerText || '');
     if (/verify you are human|attention required|are you a robot|just a moment/i.test(text.slice(0, 2000))) {
       throw new Error('DeBank menampilkan verifikasi bot (Cloudflare)');
     }
-    // Angka persis (dengan sen) diambil dari data yang halaman itu sendiri
-    // muat di browser saat dibuka — bukan request API langsung dari script.
-    // Kalau data itu tidak ketemu, pakai angka yang tampil di layar
-    // (angka layar dibulatkan ke dolar penuh, misal "$1").
-    if (pageData !== null) return pageData;
+
+    // 1. Total presisi = token semua chain + DeFi.
+    let tokenTotal = null, tokenDetail = '';
+    if (captured.perChain.size > 0) {
+      tokenTotal = 0;
+      const parts = [];
+      for (const [chain, p] of captured.perChain) {
+        tokenTotal += p.total;
+        parts.push(`${chain} $${p.total.toFixed(2)}`);
+      }
+      tokenDetail = parts.join(' + ');
+    } else if (captured.cache) {
+      tokenTotal = captured.cache.total;
+      tokenDetail = `cache ${captured.cache.tokens} token`;
+    }
+    const defiTotal = captured.project ? captured.project.total : null;
+    if (tokenTotal !== null) {
+      const total = tokenTotal + (defiTotal || 0);
+      let detail = `token $${tokenTotal.toFixed(2)} (${tokenDetail}) + DeFi $${(defiTotal || 0).toFixed(2)}`;
+      if (captured.curve !== null && Math.abs(captured.curve - total) > Math.max(0.05, total * 0.1)) {
+        detail += ` [curve $${captured.curve.toFixed(2)} beda, cek manual]`;
+      }
+      return { value: total, source: 'presisi', detail };
+    }
+
+    // 2. Cadangan: titik terakhir total_net_curve.
+    if (captured.curve !== null) {
+      return { value: captured.curve, source: 'curve', detail: `total_net_curve $${captured.curve.toFixed(2)}` };
+    }
+
+    // 3. Cadangan terakhir: angka layar (DIBULATKAN ke dolar penuh).
     const fromScreen = parseTotalFromText(text);
-    if (fromScreen !== null) return fromScreen;
+    if (fromScreen !== null) {
+      return { value: fromScreen, source: 'layar-bulat', detail: `layar $${fromScreen.toFixed(2)} (bulat, kurang presisi)` };
+    }
 
     throw new Error('total balance tidak ketemu di halaman (layout DeBank mungkin berubah)');
   } finally {
@@ -373,13 +496,13 @@ async function main() {
   }
 
   console.log(`Dibaca ${wallets.length} wallet dari ${inputFile} (skip ${invalid} baris tidak valid).`);
-  console.log(`Mode: Chromium headless buka ${PROFILE_BASE_URL}/<address>, baca total dari layar.`);
+  console.log(`Mode: Chromium headless buka ${PROFILE_BASE_URL}/<address>, baca total PRESISI dari data JSON halaman (token semua chain + DeFi), bukan angka layar yang bulat.`);
   console.log(`Batas filter: >= $${MIN_BALANCE}, jeda ${DELAY_MS}ms.`);
   console.log(PROXIES.length > 0
     ? `Proxy: ${PROXIES.length} proxy, dipakai bergiliran — ${PROXIES.map(maskProxy).join(', ')}`
     : 'Proxy: tidak ada (request langsung dari IP VPS).');
   console.log(`Output: ${outputFile}`);
-  const estimateMs = wallets.length * (DELAY_MS + 8000);
+  const estimateMs = wallets.length * (DELAY_MS + 13000);
   console.log(`Perkiraan waktu: ~${formatDuration(estimateMs)} (buka web lebih lambat dari API).`);
   console.log('Mulai...\n');
 
@@ -428,14 +551,14 @@ async function main() {
 
       if (balance === undefined) {
         // Sudah dicatat gagal di atas, lanjut ke wallet berikutnya.
-      } else if (balance < MIN_BALANCE) {
+      } else if (balance.value < MIN_BALANCE) {
         skipped++;
         process.stdout.write('\r' + ' '.repeat(100) + '\r');
-        console.log(`[${i + 1}/${wallets.length}] ${shortAddr(w.address)} ... $${formatBalance(balance)} -> buang (< $${MIN_BALANCE})`);
+        console.log(`[${i + 1}/${wallets.length}] ${shortAddr(w.address)} ... $${formatBalance(balance.value)} -> buang (< $${MIN_BALANCE}) [${balance.source}: ${balance.detail}]`);
       } else {
-        passed.push({ ...w, balance });
+        passed.push({ ...w, balance: balance.value });
         process.stdout.write('\r' + ' '.repeat(100) + '\r');
-        console.log(`[${i + 1}/${wallets.length}] ${shortAddr(w.address)} ... $${formatBalance(balance)} -> LOLOS`);
+        console.log(`[${i + 1}/${wallets.length}] ${shortAddr(w.address)} ... $${formatBalance(balance.value)} -> LOLOS [${balance.source}: ${balance.detail}]`);
       }
 
       const elapsed = Date.now() - startTime;
