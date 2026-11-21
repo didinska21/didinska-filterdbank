@@ -9,11 +9,15 @@
   },
   "scripts": {
     "start": "node filter_wallet.js",
-    "filter": "node filter_wallet.js"
+    "filter": "node filter_wallet.js",
+    "browser": "node filter_wallet_browser.js"
   },
   "engines": {
     "node": ">=18"
   },
   "license": "UNLICENSED",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "playwright": "^1.65.1"
+  }
 }
