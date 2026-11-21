@@ -1,0 +1,19 @@
+{
+  "name": "filter-wallet",
+  "version": "1.0.0",
+  "description": "Filter wallet dari balance live DeBank: update balance, buang yang di bawah $0.20, urutkan terbesar ke terkecil.",
+  "main": "filter_wallet.js",
+  "type": "commonjs",
+  "bin": {
+    "filter-wallet": "./filter_wallet.js"
+  },
+  "scripts": {
+    "start": "node filter_wallet.js",
+    "filter": "node filter_wallet.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
