@@ -6,8 +6,10 @@
  *   1. Baca file wallet (balance|address|pvkey), baris kosong dilewati.
  *   2. Buka Chromium headless, buka halaman https://debank.com/profile/<address>
  *      satu wallet satu halaman, seperti membuka web DeBank di browser.
- *   3. Tunggu tulisan "Net Worth" muncul di halaman, lalu baca angka
- *      balance yang tampil di layar itu (bukan manggil API dari script).
+ *   3. Tunggu data profil termuat, lalu baca angka total yang tampil
+ *      di layar itu (total di kanan atas, diikuti persentase perubahan,
+ *      misal "$1" lalu "-10.62%"). Label "Net Worth" tidak ada di
+ *      halaman DeBank saat ini, jadi script tidak mencari label itu.
  *   4. Update balance -> buang yang < $0.20 -> urutkan terbesar ke terkecil
  *      -> tulis ke file hasil dengan format SAMA: balance|address|pvkey.
  *
@@ -22,6 +24,11 @@
  *     yang halaman itu sendiri minta saat dimuat (bukan request API
  *     dari script). Kalau halaman menampilkan verifikasi bot, wallet
  *     itu dicatat gagal di <output>.failed.txt, bukan diam-diam hilang.
+ *   - Hasil disimpan bertahap: setelah tiap wallet selesai dicek,
+ *     file hasil dan file .failed.txt langsung ditulis ulang. Jadi
+ *     kalau run 5 jam ini di-stop (Ctrl+C) atau screen/VPS mati di
+ *     tengah jalan, hasil wallet yang sudah dicek tidak hilang —
+ *     tinggal lanjutkan dari file .failed.txt saja.
  *
  * Cara pakai:
  *   npm install            (sekali saja, menginstal Playwright)
@@ -204,15 +211,40 @@ async function resolveFiles() {
 // Baca balance dari HALAMAN web yang sudah dibuka di Chromium.
 // ---------------------------------------------------------------------------
 
-// Ambil angka "$1,234.56" pertama yang muncul setelah tulisan "Net Worth".
-function parseNetWorthFromText(text) {
+// Baca total balance dari teks halaman profil DeBank (layout nyata, 21 Nov 2026).
+// Teks halaman (dari atas): alamat wallet, lalu "This user has not added a
+// bio yet", lalu total "$1", lalu perubahan "-10.62%". Label "Net Worth"
+// TIDAK ada di halaman ini, jadi jangan cari label itu.
+// Urutan pola yang dicoba (yang pertama cocok dipakai):
+//   1. "$X" yang langsung diikuti persentase perubahan ("$1" + "-10.62%")
+//      -> total di kanan atas halaman.
+//   2. "$X" setelah "has not added a bio yet".
+//   3. "Net Worth" + "$X" (jaga-jaga kalau layout berubah lagi).
+//   4. "$X" setelah judul bagian "Wallet".
+// Perhatian: angka yang tampil di layar dibulatkan ke dolar penuh ("$1",
+// tanpa sen). Jadi nilai dari layar ini kasar — untuk desimal persisnya,
+// script memakai fallback data yang halaman itu sendiri minta saat dimuat.
+function parseTotalFromText(text) {
+  const money = (s) => {
+    const v = parseFloat(s.replace(/,/g, ''));
+    return isNaN(v) ? null : v;
+  };
+  // 1. Total + persentase: "$1\n-10.62%" atau "$1,234\n+2.50%".
+  let m = text.match(/\$\s*([\d,]+(?:\.\d{1,2})?)\s*\n?\s*-?\+?\d+\.\d+%/);
+  if (m) return money(m[1]);
+  // 2. Setelah baris bio.
+  m = text.match(/has not added a bio yet\s*\n?\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i);
+  if (m) return money(m[1]);
+  // 3. Label Net Worth (kalau muncul lagi di layout lain).
   const idx = text.search(/net worth/i);
-  if (idx === -1) return null;
-  const after = text.slice(idx, idx + 300);
-  const m = after.match(/\$\s*([\d,]+(?:\.\d{1,2})?)/);
-  if (!m) return null;
-  const v = parseFloat(m[1].replace(/,/g, ''));
-  return isNaN(v) ? null : v;
+  if (idx !== -1) {
+    m = text.slice(idx, idx + 300).match(/\$\s*([\d,]+(?:\.\d{1,2})?)/);
+    if (m) return money(m[1]);
+  }
+  // 4. Bagian Wallet.
+  m = text.match(/Wallet\s*\n\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i);
+  if (m) return money(m[1]);
+  return null;
 }
 
 async function readBalanceFromPage(page, address) {
@@ -240,11 +272,15 @@ async function readBalanceFromPage(page, address) {
       throw new Error('DeBank menampilkan verifikasi bot (Cloudflare)');
     }
 
-    // Tunggu tulisan "Net Worth" muncul (halaman SPA, balance dimuat belakangan).
+    // Tunggu data profil termuat: halaman SPA, angkanya muncul belakangan.
+    // Tanda data sudah masuk: teks "Data updated" atau pola total + persen.
     try {
-      await page.getByText(/net worth/i).first().waitFor({ timeout: 30000 });
+      await page.waitForFunction(() => {
+        const t = document.body.innerText || '';
+        return /Data updated/i.test(t) || /\$\s*[\d,]+\s*\n?\s*-?\+?\d+\.\d+%/.test(t);
+      }, { timeout: 30000 });
     } catch {
-      // Lanjut ke pembacaan teks, mungkin labelnya sudah ada tapi beda ejaan.
+      // Lanjut ke pembacaan teks, mungkin tandanya sudah ada tapi beda ejaan.
     }
     await page.waitForTimeout(2000); // beri waktu angka-nya ter-render
 
@@ -252,13 +288,15 @@ async function readBalanceFromPage(page, address) {
     if (/verify you are human|attention required|are you a robot|just a moment/i.test(text.slice(0, 2000))) {
       throw new Error('DeBank menampilkan verifikasi bot (Cloudflare)');
     }
-    const fromScreen = parseNetWorthFromText(text);
+    // Angka persis (dengan sen) diambil dari data yang halaman itu sendiri
+    // muat di browser saat dibuka — bukan request API langsung dari script.
+    // Kalau data itu tidak ketemu, pakai angka yang tampil di layar
+    // (angka layar dibulatkan ke dolar penuh, misal "$1").
+    if (pageData !== null) return pageData;
+    const fromScreen = parseTotalFromText(text);
     if (fromScreen !== null) return fromScreen;
 
-    // Fallback: data yang halaman itu sendiri minta.
-    if (pageData !== null) return pageData;
-
-    throw new Error('angka Net Worth tidak ketemu di halaman (layout DeBank mungkin berubah)');
+    throw new Error('total balance tidak ketemu di halaman (layout DeBank mungkin berubah)');
   } finally {
     page.off('response', onResponse);
   }
@@ -335,7 +373,7 @@ async function main() {
   }
 
   console.log(`Dibaca ${wallets.length} wallet dari ${inputFile} (skip ${invalid} baris tidak valid).`);
-  console.log(`Mode: Chromium headless buka ${PROFILE_BASE_URL}/<address>, baca Net Worth dari layar.`);
+  console.log(`Mode: Chromium headless buka ${PROFILE_BASE_URL}/<address>, baca total dari layar.`);
   console.log(`Batas filter: >= $${MIN_BALANCE}, jeda ${DELAY_MS}ms.`);
   console.log(PROXIES.length > 0
     ? `Proxy: ${PROXIES.length} proxy, dipakai bergiliran — ${PROXIES.map(maskProxy).join(', ')}`
@@ -354,6 +392,18 @@ async function main() {
   const failed = [];
   let skipped = 0;
   const startTime = Date.now();
+
+  // Simpan bertahap: tulis ulang file hasil (lolos, urut terbesar ke
+  // terkecil) dan file gagal setiap kali satu wallet selesai dicek,
+  // supaya hasil tidak hilang kalau run panjang ini terputus di tengah.
+  function saveProgress(outputFile, failedFile, passed, failed) {
+    const sorted = [...passed].sort((a, b) => b.balance - a.balance);
+    const out = sorted.map((w) => `${formatBalance(w.balance)}|${w.address}|${w.pvkey}`).join('\n');
+    fs.writeFileSync(outputFile, out ? out + '\n' : '');
+    if (failed.length > 0) {
+      fs.writeFileSync(failedFile, failed.map((w) => `${w.oldBalance}|${w.address}|${w.pvkey}`).join('\n') + '\n');
+    }
+  }
   const frames = ['|', '/', '-', '\\'];
   let frame = 0;
 
@@ -390,6 +440,7 @@ async function main() {
 
       const elapsed = Date.now() - startTime;
       const done = i + 1;
+      saveProgress(outputFile, failedFile, passed, failed);
       const pct = Math.round((done / wallets.length) * 100);
       const barLen = 30;
       const filled = Math.round((done / wallets.length) * barLen);
